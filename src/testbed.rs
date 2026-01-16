@@ -8,7 +8,7 @@ use crossbeam_channel::{Receiver, Sender};
 use mavlink::{MavHeader, Message};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 use crate::mav_mapper::MavMapper;
@@ -28,38 +28,28 @@ pub struct MessageStats {
 /// 后端事件
 #[derive(Debug, Clone)]
 pub enum BackendEvent {
-    /// 连接状态变化 (connected, connection_id)
     ConnectionStateChanged(bool, u64),
-    /// 收到消息
     MessageReceived(MavHeader, u32, String, HashMap<String, f64>),
-    /// 消息统计更新
     StatsUpdated(Vec<MessageStats>),
-    /// 日志消息
     Log(String),
-    /// 错误
     Error(String),
-    /// 发送统计
     SendStats { msg_name: String, count: u64 },
 }
 
 /// UI命令
 #[derive(Debug, Clone)]
 pub enum UiCommand {
-    /// 连接 (配置, 连接ID)
     Connect(ConnectionConfig, u64),
-    /// 断开
     Disconnect,
-    /// 开始发送消息
     StartSending(Vec<SendMessageConfig>),
-    /// 停止发送
     StopSending,
-    /// 更新发送配置
     UpdateSendConfig(Vec<SendMessageConfig>),
-    /// 加载XML
     LoadXml(String),
-    /// 关闭
     Shutdown,
 }
+
+/// 共享的发送配置
+pub type SharedSendConfigs = Arc<RwLock<Vec<SendMessageConfig>>>;
 
 /// 测试台后端
 pub struct TestbedBackend {
@@ -67,6 +57,7 @@ pub struct TestbedBackend {
     cmd_rx: Receiver<UiCommand>,
     mapper: Option<Arc<MavMapper>>,
     running: Arc<AtomicBool>,
+    send_configs: SharedSendConfigs,  // 共享配置
 }
 
 impl TestbedBackend {
@@ -76,6 +67,7 @@ impl TestbedBackend {
             cmd_rx,
             mapper: None,
             running: Arc::new(AtomicBool::new(true)),
+            send_configs: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -85,10 +77,9 @@ impl TestbedBackend {
         let mut send_running = Arc::new(AtomicBool::new(false));
         let mut stats: HashMap<u32, MessageStats> = HashMap::new();
         let mut last_stats_update = Instant::now();
-        let mut current_connection_id: u64 = 0;  // 当前活跃的连接ID
+        let mut current_connection_id: u64 = 0;
 
         while self.running.load(Ordering::Relaxed) {
-            // 处理命令
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
                     UiCommand::LoadXml(path) => {
@@ -105,10 +96,8 @@ impl TestbedBackend {
                     }
 
                     UiCommand::Connect(config, conn_id) => {
-                        // 断开旧连接
                         connection_running.store(false, Ordering::Relaxed);
                         send_running.store(false, Ordering::Relaxed);
-                        // 调用shutdown关闭mav_conn的connection_loop线程
                         if let Some(ref tx) = mav_tx {
                             tx.shutdown();
                         }
@@ -119,19 +108,15 @@ impl TestbedBackend {
                         let is_connectionless = config.conn_type.is_connectionless();
                         self.log(format!("连接中: {}", addr));
 
-                        // 创建新连接
                         let mav_config = MavConfig::new("testbed", &addr, &addr)
                             .with_self_id(config.system_id, config.component_id)
-                            .with_heartbeat(1000)  // 启用心跳保持连接
+                            .with_heartbeat(1000)
                             .with_subscriptions(vec![]);
 
                         let (tx, rx) = connect(mav_config);
                         mav_tx = Some(tx);
-
-                        // 使用传入的连接ID
                         current_connection_id = conn_id;
 
-                        // 启动接收线程
                         let event_tx = self.event_tx.clone();
                         let mapper = self.mapper.clone();
                         let conn_running = Arc::new(AtomicBool::new(true));
@@ -143,17 +128,12 @@ impl TestbedBackend {
                                 Self::recv_loop(rx, event_tx, mapper, conn_running, is_connectionless, conn_id);
                             })
                             .expect("spawn recv thread");
-
-                        // 不再立即发送已连接状态
-                        // TCP: 等待mav_conn内部握手成功后收到消息
-                        // UDP: 等待收到第一条消息
                     }
 
                     UiCommand::Disconnect => {
                         self.log("断开连接".to_string());
                         connection_running.store(false, Ordering::Relaxed);
                         send_running.store(false, Ordering::Relaxed);
-                        // 调用shutdown关闭mav_conn的connection_loop线程
                         if let Some(ref tx) = mav_tx {
                             tx.shutdown();
                         }
@@ -165,14 +145,20 @@ impl TestbedBackend {
                     UiCommand::StartSending(configs) => {
                         if let Some(tx) = mav_tx.clone() {
                             if let Some(mapper) = self.mapper.clone() {
+                                // 更新共享配置
+                                if let Ok(mut cfg) = self.send_configs.write() {
+                                    *cfg = configs;
+                                }
+
                                 send_running.store(true, Ordering::Relaxed);
                                 let running = send_running.clone();
                                 let event_tx = self.event_tx.clone();
+                                let shared_configs = self.send_configs.clone();
 
                                 thread::Builder::new()
                                     .name("mav-send".to_string())
                                     .spawn(move || {
-                                        Self::send_loop(tx, mapper, configs, running, event_tx);
+                                        Self::send_loop(tx, mapper, shared_configs, running, event_tx);
                                     })
                                     .expect("spawn send thread");
 
@@ -190,8 +176,11 @@ impl TestbedBackend {
                         self.log("停止发送".to_string());
                     }
 
-                    UiCommand::UpdateSendConfig(_configs) => {
-                        // 配置更新会在下一轮发送循环生效
+                    UiCommand::UpdateSendConfig(configs) => {
+                        // 实时更新共享配置
+                        if let Ok(mut cfg) = self.send_configs.write() {
+                            *cfg = configs;
+                        }
                     }
 
                     UiCommand::Shutdown => {
@@ -203,7 +192,6 @@ impl TestbedBackend {
                 }
             }
 
-            // 定期发送统计 - 增加间隔减少闪烁
             if last_stats_update.elapsed() > Duration::from_millis(1000) {
                 let stats_vec: Vec<MessageStats> = stats.values().cloned().collect();
                 let _ = self.event_tx.send(BackendEvent::StatsUpdated(stats_vec));
@@ -219,31 +207,27 @@ impl TestbedBackend {
         event_tx: Sender<BackendEvent>,
         mapper: Option<Arc<MavMapper>>,
         running: Arc<AtomicBool>,
-        is_connectionless: bool,  // UDP是无连接的
+        is_connectionless: bool,
         connection_id: u64,
     ) {
         let mut stats: HashMap<u32, MessageStats> = HashMap::new();
         let mut last_stats_send = Instant::now();
-        let mut connection_reported = false;  // 是否已报告连接状态
+        let mut connection_reported = false;
 
-        // UDP：直接设为已连接，不等待收到消息
         if is_connectionless {
             let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
             connection_reported = true;
         }
 
         while running.load(Ordering::Relaxed) {
-            // TCP：检查底层连接状态
             if !is_connectionless {
                 let is_connected = rx.is_connected();
 
-                // 底层已连接但还没报告 → 发送已连接状态
                 if is_connected && !connection_reported {
                     connection_reported = true;
                     let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
                 }
 
-                // 已报告连接但底层断开 → 发送断开状态
                 if connection_reported && !is_connected {
                     rx.shutdown();
                     let _ = event_tx.send(BackendEvent::ConnectionStateChanged(false, connection_id));
@@ -253,12 +237,10 @@ impl TestbedBackend {
             }
 
             if let Some((header, msg)) = rx.recv_timeout(Duration::from_millis(100)) {
-                // 再次检查running，防止断开后仍发送连接成功事件
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // 收到消息时确保已报告连接状态
                 if !connection_reported {
                     connection_reported = true;
                     let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
@@ -271,13 +253,11 @@ impl TestbedBackend {
                     .map(|s| s.to_string())
                     .unwrap_or_else(|| format!("MSG_{}", msg_id));
 
-                // 解析字段
                 let mut fields = HashMap::new();
                 if let Some(mapper) = &mapper {
                     mapper.parsing_mavlink_msg(&msg, &mut fields);
                 }
 
-                // 更新统计
                 let stat = stats.entry(msg_id).or_insert_with(|| MessageStats {
                     msg_id,
                     msg_name: msg_name.clone(),
@@ -287,8 +267,6 @@ impl TestbedBackend {
                 let now = Instant::now();
                 if let Some(last) = stat.last_seen {
                     let elapsed = now.duration_since(last).as_secs_f32();
-                    // 设置下限防止异常高频率（最高显示1000Hz）
-                    // 当消息密集到达时（如TCP缓冲区堆积），elapsed可能极小
                     if elapsed > 0.001 {
                         stat.rate_hz = stat.rate_hz * 0.9 + (1.0 / elapsed) * 0.1;
                     }
@@ -297,7 +275,6 @@ impl TestbedBackend {
                 stat.last_header = Some(header);
                 stat.last_fields = fields.clone();
 
-                // 发送事件
                 let _ = event_tx.send(BackendEvent::MessageReceived(
                     header,
                     msg_id,
@@ -305,7 +282,6 @@ impl TestbedBackend {
                     fields,
                 ));
 
-                // 定期发送统计 - 增加间隔减少闪烁
                 if last_stats_send.elapsed() > Duration::from_millis(1000) {
                     let stats_vec: Vec<MessageStats> = stats.values().cloned().collect();
                     let _ = event_tx.send(BackendEvent::StatsUpdated(stats_vec));
@@ -318,22 +294,23 @@ impl TestbedBackend {
     fn send_loop(
         tx: MavTx,
         mapper: Arc<MavMapper>,
-        configs: Vec<SendMessageConfig>,
+        shared_configs: SharedSendConfigs,
         running: Arc<AtomicBool>,
         event_tx: Sender<BackendEvent>,
     ) {
         let mut last_send: HashMap<String, Instant> = HashMap::new();
         let mut send_counts: HashMap<String, u64> = HashMap::new();
 
-        // 调试：打印配置信息
-        let _ = event_tx.send(BackendEvent::Log(format!("发送线程启动，共{}个消息配置", configs.len())));
-        for cfg in &configs {
-            let _ = event_tx.send(BackendEvent::Log(format!("  - {} (id={}, rate={}Hz)",
-                                                            cfg.msg_name, cfg.msg_id, cfg.rate_hz)));
-        }
+        let _ = event_tx.send(BackendEvent::Log("发送线程启动".to_string()));
 
         while running.load(Ordering::Relaxed) {
             let now = Instant::now();
+
+            // 每次循环读取最新配置
+            let configs = match shared_configs.read() {
+                Ok(cfg) => cfg.clone(),
+                Err(_) => continue,
+            };
 
             for config in &configs {
                 if !config.enabled || config.rate_hz <= 0.0 {
@@ -373,10 +350,8 @@ impl TestbedBackend {
                     }
                 }
 
-                // 获取目标信息
                 let (target_sys, target_comp) = tx.target();
 
-                // 构建消息
                 match mapper.get_mavlink_msg_with_target(
                     config.msg_id,
                     &metas,
@@ -384,7 +359,6 @@ impl TestbedBackend {
                     target_comp,
                 ) {
                     Some(msg) => {
-                        // 发送
                         let result = if config.use_custom_header {
                             let header = MavHeader {
                                 system_id: config.header_system_id,
@@ -409,7 +383,6 @@ impl TestbedBackend {
                         });
                     }
                     None => {
-                        // 只在第一次失败时打印
                         if !last_send.contains_key(&config.id) {
                             let _ = event_tx.send(BackendEvent::Error(format!("消息构建失败: {} (id={})", config.msg_name, config.msg_id)));
                         }

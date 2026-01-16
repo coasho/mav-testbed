@@ -395,6 +395,14 @@ impl MavTestbedApp {
         let _ = self.cmd_tx.send(UiCommand::StopSending);
         self.is_sending = false;
     }
+
+    /// 发送配置更新到后端（实时生效）
+    fn send_config_update(&self) {
+        if self.is_sending {
+            let configs = self.send_configs.clone();
+            let _ = self.cmd_tx.send(UiCommand::UpdateSendConfig(configs));
+        }
+    }
 }
 
 impl eframe::App for MavTestbedApp {
@@ -701,6 +709,7 @@ impl MavTestbedApp {
                                     if ui.add(cb).changed() && !checked {
                                         self.selected_messages.remove(&msg_id);
                                         self.send_configs.retain(|c| c.msg_id != msg_id);
+                                        self.send_config_update();
                                     }
                                     ui.label(
                                         egui::RichText::new(format!("[{}]", msg_id))
@@ -773,6 +782,7 @@ impl MavTestbedApp {
                         for (msg_id, msg_name) in to_add {
                             self.selected_messages.insert(msg_id);
                             self.add_send_config(msg_id, &msg_name);
+                            self.send_config_update();
                         }
                     });
             });
@@ -826,7 +836,7 @@ impl MavTestbedApp {
                         .show(ui, |ui| {
                             let mut to_remove = None;
                             let mut to_edit = None;
-
+                            let mut config_changed = false;
                             for (idx, config) in self.send_configs.iter_mut().enumerate() {
                                 let border_color = if config.enabled {
                                     egui::Color32::from_rgb(0, 180, 0)
@@ -839,7 +849,6 @@ impl MavTestbedApp {
                                 } else {
                                     ui.style().visuals.extreme_bg_color
                                 };
-
                                 egui::Frame::none()
                                     .fill(bg_color)
                                     .stroke(egui::Stroke::new(2.0, border_color))
@@ -849,7 +858,9 @@ impl MavTestbedApp {
                                     .show(ui, |ui| {
                                         // 第一行：启用开关、名称、按钮
                                         ui.horizontal(|ui| {
-                                            ui.checkbox(&mut config.enabled, "");
+                                            if ui.checkbox(&mut config.enabled, "").changed() && self.is_sending {
+                                                config_changed = true;
+                                            }
                                             ui.label(
                                                 egui::RichText::new(&config.msg_name)
                                                     .strong()
@@ -879,12 +890,14 @@ impl MavTestbedApp {
                                             ui.label(
                                                 egui::RichText::new("发送频率:").size(FONT_SIZE_BASE)
                                             );
-                                            ui.add(
+                                            if ui.add(
                                                 egui::DragValue::new(&mut config.rate_hz)
                                                     .speed(0.1)
                                                     .range(0.1..=100.0)
                                                     .suffix(" Hz"),
-                                            );
+                                            ).changed() && self.is_sending {
+                                                config_changed = true;
+                                            }
 
                                             ui.add_space(SPACING_LARGE);
 
@@ -948,10 +961,13 @@ impl MavTestbedApp {
                                         }
                                     });
                             }
-
+                            if config_changed {
+                                self.send_config_update();
+                            }
                             if let Some(idx) = to_remove {
                                 let config = self.send_configs.remove(idx);
                                 self.selected_messages.remove(&config.msg_id);
+                                self.send_config_update();
                             }
 
                             if let Some(idx) = to_edit {
@@ -1806,5 +1822,8 @@ impl MavTestbedApp {
             self.send_configs.push(self.edit_dialog.config.clone());
             self.selected_messages.insert(self.edit_dialog.config.msg_id);
         }
+
+        // 实时更新到后端
+        self.send_config_update();
     }
 }
