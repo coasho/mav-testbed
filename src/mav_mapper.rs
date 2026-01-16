@@ -705,8 +705,6 @@ impl MavMapper {
         let payload_size: usize = field_info.iter().map(|(_, ft, _, _)| ft.size()).sum();
         let mut payload = vec![0u8; payload_size];
 
-        let mut found_any_value = false;
-
         for (field_name, field_type, _units, offset) in &field_info {
             let array_len = field_type.array_length();
             if field_type.is_array() && array_len > 1 {
@@ -714,23 +712,18 @@ impl MavMapper {
                     let indexed_name = format!("{}[{}]", field_name, i);
                     let key = format!("{}:{}", msg_name, indexed_name);
                     if let Some(&value) = metas.get(&key) {
-                        found_any_value = true;
                         field_type.write_array_element(&mut payload, *offset, i, value);
                     }
                 }
             } else {
                 let key = format!("{}:{}", msg_name, field_name);
                 if let Some(&value) = metas.get(&key) {
-                    found_any_value = true;
                     field_type.write_value(&mut payload, *offset, value);
                 }
             }
         }
 
-        if !found_any_value {
-            return None;
-        }
-
+        // 即使没有匹配的字段值，也发送消息（payload全0）
         MavMessage::parse(mavlink::MavlinkVersion::V2, msg_id, &payload).ok()
     }
 
@@ -749,22 +742,17 @@ impl MavMapper {
         let payload_size: usize = field_info.iter().map(|(_, ft, _, _)| ft.size()).sum();
         let mut payload = vec![0u8; payload_size];
 
-        let mut found_any_value = false;
-
         for (field_name, field_type, _units, offset) in &field_info {
             // 自动填充 target 字段
             let value = match field_name.as_str() {
                 "target_system" => {
-                    found_any_value = true;
                     Some(target_system as f64)
                 }
                 "target_component" => {
-                    found_any_value = true;
                     Some(target_component as f64)
                 }
                 "target" => {
                     // MANUAL_CONTROL 等消息用 target 而不是 target_system
-                    found_any_value = true;
                     Some(target_system as f64)
                 }
                 _ => {
@@ -775,7 +763,6 @@ impl MavMapper {
                             let indexed_name = format!("{}[{}]", field_name, i);
                             let key = format!("{}:{}", msg_name, indexed_name);
                             if let Some(&v) = metas.get(&key) {
-                                found_any_value = true;
                                 field_type.write_array_element(&mut payload, *offset, i, v);
                             }
                         }
@@ -788,15 +775,11 @@ impl MavMapper {
             };
 
             if let Some(v) = value {
-                found_any_value = true;
                 field_type.write_value(&mut payload, *offset, v);
             }
         }
 
-        if !found_any_value {
-            return None;
-        }
-
+        // 即使没有匹配的字段值，也发送消息（payload未设置的字段为0）
         MavMessage::parse(mavlink::MavlinkVersion::V2, msg_id, &payload).ok()
     }
 

@@ -589,6 +589,7 @@ async fn send_subscriptions(
 pub struct MavTx {
     tx: CbSender<SendItem>,
     connected: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,  // 控制connection_loop退出
     target: TargetInfo,
 }
 
@@ -621,11 +622,18 @@ impl MavTx {
     pub fn target(&self) -> (u8, u8) {
         self.target.get()
     }
+
+    /// 关闭连接，停止connection_loop线程
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.connected.store(false, Ordering::Relaxed);
+    }
 }
 
 pub struct MavRx {
     rx: CbReceiver<(MavHeader, MavMessage)>,
     connected: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
 }
 
 impl MavRx {
@@ -643,6 +651,12 @@ impl MavRx {
 
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::Relaxed)
+    }
+
+    /// 关闭连接，停止connection_loop线程
+    pub fn shutdown(&self) {
+        self.running.store(false, Ordering::Relaxed);
+        self.connected.store(false, Ordering::Relaxed);
     }
 }
 
@@ -665,9 +679,11 @@ fn connect_direct(cfg: MavConfig) -> (MavTx, MavRx) {
     let (out_tx, out_rx) = crossbeam_channel::unbounded::<(MavHeader, MavMessage)>();
     let (in_tx, in_rx) = bounded::<SendItem>(16);
     let connected = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(true));
     let target = TargetInfo::new();
 
     let conn = connected.clone();
+    let run = running.clone();
     let tgt = target.clone();
 
     std::thread::Builder::new()
@@ -677,7 +693,7 @@ fn connect_direct(cfg: MavConfig) -> (MavTx, MavRx) {
                 .enable_all()
                 .build()
                 .expect("tokio runtime");
-            rt.block_on(connection_loop(cfg, in_rx, out_tx, conn, tgt));
+            rt.block_on(connection_loop(cfg, in_rx, out_tx, conn, run, tgt));
         })
         .expect("spawn thread");
 
@@ -685,11 +701,13 @@ fn connect_direct(cfg: MavConfig) -> (MavTx, MavRx) {
         MavTx {
             tx: in_tx,
             connected: connected.clone(),
+            running: running.clone(),
             target: target.clone(),
         },
         MavRx {
             rx: out_rx,
             connected,
+            running,
         },
     )
 }
@@ -701,18 +719,20 @@ fn connect_direct(cfg: MavConfig) -> (MavTx, MavRx) {
 /// 2. 周期性发心跳 + 周期性发订阅
 /// 3. PX4 无论何时重启，几秒内自动恢复
 /// 4. 只有 socket 出错才重连
+/// 5. running为false时退出
 async fn connection_loop(
     cfg: MavConfig,
     send_queue: CbReceiver<SendItem>,
     recv_out: CbSender<(MavHeader, MavMessage)>,
     connected: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
     target: TargetInfo,
 ) {
     let addrs = [&cfg.addr1, &cfg.addr2];
     let name = &cfg.name;
     let mut idx = 0;
 
-    loop {
+    while running.load(Ordering::Relaxed) {
         let addr = addrs[idx];
         println!("[{}] 连接 {}", name, addr);
 
@@ -739,11 +759,19 @@ async fn connection_loop(
                     name,
                     &target,
                     transport,
+                    &running,
                 )
-                .await;
+                    .await;
 
-                // run_io 返回说明 socket 出错
+                // run_io 返回说明 socket 出错或被关闭
                 connected.store(false, Ordering::Relaxed);
+
+                // 如果是主动关闭，直接退出，不打印"连接断开"
+                if !running.load(Ordering::Relaxed) {
+                    println!("[{}] 连接已关闭", name);
+                    break;
+                }
+
                 println!("[{}] 连接断开", name);
 
                 // 显式 drop，释放串口资源
@@ -774,6 +802,7 @@ async fn connection_loop(
 /// - PX4 重启？没关系，几秒内自动收到订阅请求，恢复数据流
 /// - 串口/TCP：socket 出错才返回
 /// - UDP：永不返回，IO 错误只是对端未响应
+/// - running为false时退出
 async fn run_io(
     tx: &mut Sender<MavMessage>,
     rx: &mut Receiver<MavMessage>,
@@ -783,6 +812,7 @@ async fn run_io(
     name: &str,
     target: &TargetInfo,
     transport: TransportType,
+    running: &Arc<AtomicBool>,
 ) {
     let mut last_heartbeat = Instant::now() - Duration::from_secs(10); // 立即发第一个心跳
     let mut last_subscription = Instant::now(); // 订阅不要立即发
@@ -792,9 +822,9 @@ async fn run_io(
     // UDP 是无连接协议，其他都是面向连接的
     let is_connectionless = transport == TransportType::Udp;
 
-    loop {
-        // 周期性发心跳
-        if last_heartbeat.elapsed().as_millis() as u64 >= cfg.heartbeat_ms {
+    while running.load(Ordering::Relaxed) {
+        // 周期性发心跳（heartbeat_ms > 0时才发送）
+        if cfg.heartbeat_ms > 0 && last_heartbeat.elapsed().as_millis() as u64 >= cfg.heartbeat_ms {
             let (h, m) = make_heartbeat(cfg.self_system_id, cfg.self_component_id);
             if let Err(e) = tx.send_with_header(&h, &m).await {
                 if is_connectionless {
@@ -823,20 +853,34 @@ async fn run_io(
         }
 
         // 发送用户消息
-        while let Ok(item) = send_queue.try_recv() {
-            let result = match item {
-                SendItem::Message(msg) => tx.send(&msg).await,
-                SendItem::WithHeader(header, msg) => tx.send_with_header(&header, &msg).await,
-            };
-            if let Err(e) = result {
-                if is_connectionless {
-                    // UDP 发送失败继续
-                    if peer_responding {
-                        println!("[{}] 发送失败: {} (UDP继续)", name, e);
-                        peer_responding = false;
+        // 检测send_queue是否已关闭（发送端被drop）
+        loop {
+            match send_queue.try_recv() {
+                Ok(item) => {
+                    let result = match item {
+                        SendItem::Message(msg) => tx.send(&msg).await,
+                        SendItem::WithHeader(header, msg) => tx.send_with_header(&header, &msg).await,
+                    };
+                    if let Err(e) = result {
+                        if is_connectionless {
+                            // UDP 发送失败继续
+                            if peer_responding {
+                                println!("[{}] 发送失败: {} (UDP继续)", name, e);
+                                peer_responding = false;
+                            }
+                        } else {
+                            println!("[{}] 发送失败: {}", name, e);
+                            return;
+                        }
                     }
-                } else {
-                    println!("[{}] 发送失败: {}", name, e);
+                }
+                Err(crossbeam_channel::TryRecvError::Empty) => {
+                    // 队列为空，正常情况，退出内层循环继续接收
+                    break;
+                }
+                Err(crossbeam_channel::TryRecvError::Disconnected) => {
+                    // 发送端被drop，说明用户断开了连接，退出connection_loop
+                    println!("[{}] 发送队列已关闭，断开连接", name);
                     return;
                 }
             }
@@ -950,6 +994,7 @@ fn connect_proxy_internal(cfg: MavConfig) -> (MavTx, MavRx) {
     let (out_tx, out_rx) = bounded::<(MavHeader, MavMessage)>(64);
     let (in_tx, in_rx) = bounded::<SendItem>(16);
     let connected = Arc::new(AtomicBool::new(true));
+    let running = Arc::new(AtomicBool::new(true));
     let target = TargetInfo::new();
 
     // 关键修复：设置代理模式的 self_system_id 和 self_component_id
@@ -974,11 +1019,13 @@ fn connect_proxy_internal(cfg: MavConfig) -> (MavTx, MavRx) {
         MavTx {
             tx: in_tx,
             connected: connected.clone(),
+            running: running.clone(),
             target: target.clone(),
         },
         MavRx {
             rx: out_rx,
             connected,
+            running,
         },
     )
 }
@@ -1111,5 +1158,10 @@ impl MavConn {
     /// 获取当前 self_component_id
     pub fn self_component_id(&self) -> u8 {
         self.config.self_component_id
+    }
+
+    /// 关闭连接
+    pub fn shutdown(&self) {
+        self.tx.shutdown();
     }
 }

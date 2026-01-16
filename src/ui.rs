@@ -76,6 +76,9 @@ pub struct MavTestbedApp {
     connection_config: ConnectionConfig,
     connection_id: u64,  // 当前连接ID，用于过滤旧连接的事件
 
+    // 串口列表
+    available_ports: Vec<String>,
+
     // 消息列表
     all_messages: Vec<(u32, String)>,
     search_filter: String,
@@ -158,6 +161,7 @@ impl MavTestbedApp {
             is_sending: false,
             connection_config: ConnectionConfig::default(),
             connection_id: 0,
+            available_ports: Self::enumerate_serial_ports(),
             all_messages: Vec::new(),
             search_filter: String::new(),
             selected_messages: HashSet::new(),
@@ -181,6 +185,23 @@ impl MavTestbedApp {
         }
 
         app
+    }
+
+    /// 枚举可用串口
+    fn enumerate_serial_ports() -> Vec<String> {
+        match serialport::available_ports() {
+            Ok(ports) => {
+                let mut names: Vec<String> = ports.into_iter().map(|p| p.port_name).collect();
+                names.sort();
+                names
+            }
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// 刷新串口列表
+    fn refresh_serial_ports(&mut self) {
+        self.available_ports = Self::enumerate_serial_ports();
     }
 
     fn load_xml(&mut self, path: &str) {
@@ -231,6 +252,11 @@ impl MavTestbedApp {
                     }
                 }
                 BackendEvent::MessageReceived(header, msg_id, msg_name, fields) => {
+                    // 只有已连接或连接中状态才处理消息
+                    if !self.is_connected && !self.is_connecting {
+                        continue;  // 忽略断开状态下收到的消息
+                    }
+
                     // 首次收到消息时，如果正在连接中，则确认连接成功
                     if self.is_connecting && !self.is_connected {
                         self.is_connected = true;
@@ -251,6 +277,10 @@ impl MavTestbedApp {
                     }
                 }
                 BackendEvent::StatsUpdated(stats) => {
+                    // 只有已连接状态才处理统计更新
+                    if !self.is_connected {
+                        continue;
+                    }
                     // 合并更新而非完全替换，避免UI闪烁
                     for new_stat in stats {
                         if let Some(existing) = self.recv_stats.iter_mut().find(|s| s.msg_id == new_stat.msg_id) {
@@ -320,6 +350,10 @@ impl MavTestbedApp {
         self.is_connecting = false;
         self.is_connected = false;
         self.is_sending = false;
+        // 清空接收数据，防止旧连接的数据残留
+        self.recv_stats.clear();
+        self.recv_messages.clear();
+        self.selected_recv_msg = None;
         // 清空事件队列，防止旧事件覆盖断开状态
         while self.event_rx.try_recv().is_ok() {}
         let _ = self.cmd_tx.send(UiCommand::Disconnect);
@@ -392,7 +426,7 @@ impl MavTestbedApp {
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new(format!("测试端编号{}", self.window_id))
+                egui::RichText::new(format!("🛩 MAVLink测试台 #{}", self.window_id))
                     .strong()
                     .size(16.0),
             );
@@ -1059,11 +1093,41 @@ impl MavTestbedApp {
                             }
                             ConnectionType::Serial => {
                                 ui.label("串口:");
-                                ui.add(egui::TextEdit::singleline(&mut self.connection_config.serial_port).desired_width(150.0));
+                                ui.horizontal(|ui| {
+                                    egui::ComboBox::from_id_salt("serial_port_combo")
+                                        .width(120.0)
+                                        .selected_text(if self.connection_config.serial_port.is_empty() {
+                                            "选择串口".to_string()
+                                        } else {
+                                            self.connection_config.serial_port.clone()
+                                        })
+                                        .show_ui(ui, |ui| {
+                                            for port in &self.available_ports {
+                                                ui.selectable_value(
+                                                    &mut self.connection_config.serial_port,
+                                                    port.clone(),
+                                                    port,
+                                                );
+                                            }
+                                        });
+                                    if ui.button("🔄").on_hover_text("刷新串口列表").clicked() {
+                                        self.refresh_serial_ports();
+                                    }
+                                });
                                 ui.end_row();
 
                                 ui.label("波特率:");
-                                ui.add(egui::DragValue::new(&mut self.connection_config.baud_rate));
+                                egui::ComboBox::from_id_salt("baud_rate_combo")
+                                    .selected_text(format!("{}", self.connection_config.baud_rate))
+                                    .show_ui(ui, |ui| {
+                                        for &baud in &[9600u32, 19200, 38400, 57600, 115200, 230400, 460800, 921600] {
+                                            ui.selectable_value(
+                                                &mut self.connection_config.baud_rate,
+                                                baud,
+                                                format!("{}", baud),
+                                            );
+                                        }
+                                    });
                                 ui.end_row();
                             }
                         }

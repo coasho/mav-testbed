@@ -108,6 +108,10 @@ impl TestbedBackend {
                         // 断开旧连接
                         connection_running.store(false, Ordering::Relaxed);
                         send_running.store(false, Ordering::Relaxed);
+                        // 调用shutdown关闭mav_conn的connection_loop线程
+                        if let Some(ref tx) = mav_tx {
+                            tx.shutdown();
+                        }
                         mav_tx = None;
                         stats.clear();
 
@@ -118,7 +122,7 @@ impl TestbedBackend {
                         // 创建新连接
                         let mav_config = MavConfig::new("testbed", &addr, &addr)
                             .with_self_id(config.system_id, config.component_id)
-                            .with_heartbeat(1000)
+                            .with_heartbeat(1000)  // 启用心跳保持连接
                             .with_subscriptions(vec![]);
 
                         let (tx, rx) = connect(mav_config);
@@ -149,6 +153,10 @@ impl TestbedBackend {
                         self.log("断开连接".to_string());
                         connection_running.store(false, Ordering::Relaxed);
                         send_running.store(false, Ordering::Relaxed);
+                        // 调用shutdown关闭mav_conn的connection_loop线程
+                        if let Some(ref tx) = mav_tx {
+                            tx.shutdown();
+                        }
                         mav_tx = None;
                         stats.clear();
                         let _ = self.event_tx.send(BackendEvent::ConnectionStateChanged(false, current_connection_id));
@@ -211,25 +219,40 @@ impl TestbedBackend {
         event_tx: Sender<BackendEvent>,
         mapper: Option<Arc<MavMapper>>,
         running: Arc<AtomicBool>,
-        _is_connectionless: bool,
+        is_connectionless: bool,  // UDP是无连接的
         connection_id: u64,
     ) {
         let mut stats: HashMap<u32, MessageStats> = HashMap::new();
         let mut last_stats_send = Instant::now();
         let mut first_message_received = false;
 
+        // UDP：直接设为已连接，不等待收到消息
+        if is_connectionless {
+            let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
+        }
+
         while running.load(Ordering::Relaxed) {
+            // 只有TCP才检查连接状态（UDP不检查）
+            if !is_connectionless && first_message_received && !rx.is_connected() {
+                // 关键：停止mav_conn的connection_loop，防止继续发心跳或自动重连
+                rx.shutdown();
+                let _ = event_tx.send(BackendEvent::ConnectionStateChanged(false, connection_id));
+                let _ = event_tx.send(BackendEvent::Log("对端已断开".to_string()));
+                break;
+            }
+
             if let Some((header, msg)) = rx.recv_timeout(Duration::from_millis(100)) {
                 // 再次检查running，防止断开后仍发送连接成功事件
                 if !running.load(Ordering::Relaxed) {
                     break;
                 }
 
-                // 首次收到消息，发送已连接状态（带连接ID）
-                if !first_message_received {
+                // TCP：首次收到消息才设为已连接
+                if !is_connectionless && !first_message_received {
                     first_message_received = true;
                     let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
                 }
+                first_message_received = true;
 
                 let msg_id = msg.message_id();
                 let msg_name = mapper
@@ -254,7 +277,9 @@ impl TestbedBackend {
                 let now = Instant::now();
                 if let Some(last) = stat.last_seen {
                     let elapsed = now.duration_since(last).as_secs_f32();
-                    if elapsed > 0.0 {
+                    // 设置下限防止异常高频率（最高显示1000Hz）
+                    // 当消息密集到达时（如TCP缓冲区堆积），elapsed可能极小
+                    if elapsed > 0.001 {
                         stat.rate_hz = stat.rate_hz * 0.9 + (1.0 / elapsed) * 0.1;
                     }
                 }
@@ -289,6 +314,13 @@ impl TestbedBackend {
     ) {
         let mut last_send: HashMap<String, Instant> = HashMap::new();
         let mut send_counts: HashMap<String, u64> = HashMap::new();
+
+        // 调试：打印配置信息
+        let _ = event_tx.send(BackendEvent::Log(format!("发送线程启动，共{}个消息配置", configs.len())));
+        for cfg in &configs {
+            let _ = event_tx.send(BackendEvent::Log(format!("  - {} (id={}, rate={}Hz)",
+                                                            cfg.msg_name, cfg.msg_id, cfg.rate_hz)));
+        }
 
         while running.load(Ordering::Relaxed) {
             let now = Instant::now();
@@ -335,31 +367,43 @@ impl TestbedBackend {
                 let (target_sys, target_comp) = tx.target();
 
                 // 构建消息
-                if let Some(msg) = mapper.get_mavlink_msg_with_target(
+                match mapper.get_mavlink_msg_with_target(
                     config.msg_id,
                     &metas,
                     target_sys,
                     target_comp,
                 ) {
-                    // 发送
-                    if config.use_custom_header {
-                        let header = MavHeader {
-                            system_id: config.header_system_id,
-                            component_id: config.header_component_id,
-                            sequence: 0,
+                    Some(msg) => {
+                        // 发送
+                        let result = if config.use_custom_header {
+                            let header = MavHeader {
+                                system_id: config.header_system_id,
+                                component_id: config.header_component_id,
+                                sequence: 0,
+                            };
+                            tx.send_with_header(header, msg)
+                        } else {
+                            tx.send(msg)
                         };
-                        let _ = tx.send_with_header(header, msg);
-                    } else {
-                        let _ = tx.send(msg);
+
+                        if let Err(e) = result {
+                            let _ = event_tx.send(BackendEvent::Error(format!("发送失败: {} - {}", config.msg_name, e)));
+                        }
+
+                        last_send.insert(config.id.clone(), now);
+                        *send_counts.entry(config.msg_name.clone()).or_insert(0) += 1;
+
+                        let _ = event_tx.send(BackendEvent::SendStats {
+                            msg_name: config.msg_name.clone(),
+                            count: send_counts[&config.msg_name],
+                        });
                     }
-
-                    last_send.insert(config.id.clone(), now);
-                    *send_counts.entry(config.msg_name.clone()).or_insert(0) += 1;
-
-                    let _ = event_tx.send(BackendEvent::SendStats {
-                        msg_name: config.msg_name.clone(),
-                        count: send_counts[&config.msg_name],
-                    });
+                    None => {
+                        // 只在第一次失败时打印
+                        if !last_send.contains_key(&config.id) {
+                            let _ = event_tx.send(BackendEvent::Error(format!("消息构建失败: {} (id={})", config.msg_name, config.msg_id)));
+                        }
+                    }
                 }
             }
 

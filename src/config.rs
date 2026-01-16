@@ -30,7 +30,7 @@ impl ConnectionType {
             ConnectionType::Serial => "串口",
         }
     }
-    
+
     pub fn all() -> Vec<ConnectionType> {
         vec![
             ConnectionType::TcpClient,
@@ -41,12 +41,12 @@ impl ConnectionType {
             ConnectionType::Serial,
         ]
     }
-    
+
     /// 是否为无连接协议（UDP）
     pub fn is_connectionless(&self) -> bool {
         matches!(self, ConnectionType::UdpOut | ConnectionType::UdpIn | ConnectionType::Udp)
     }
-    
+
     /// 是否为TCP类型
     pub fn is_tcp(&self) -> bool {
         matches!(self, ConnectionType::TcpClient | ConnectionType::TcpServer)
@@ -88,7 +88,7 @@ impl ConnectionConfig {
             ConnectionType::TcpClient => format!("tcpout:{}:{}", self.host, self.port),
             ConnectionType::TcpServer => format!("tcpin:{}", self.port),
             ConnectionType::UdpOut => format!("udpout:{}:{}", self.host, self.port),
-            ConnectionType::UdpIn => format!("udpin:0.0.0.0:{}", self.local_port),
+            ConnectionType::UdpIn => format!("udpin:0.0.0.0:{}", self.port),  // 使用port，与UI一致
             ConnectionType::Udp => format!("udp:{}:{}-{}", self.host, self.port, self.local_port),
             ConnectionType::Serial => format!("serial:{}:{}", self.serial_port, self.baud_rate),
         }
@@ -184,17 +184,17 @@ impl ConfigManager {
     pub fn new() -> Self {
         let config_dir = Self::get_config_dir();
         let records_dir = config_dir.join("records");
-        
+
         // 确保目录存在
         let _ = fs::create_dir_all(&config_dir);
         let _ = fs::create_dir_all(&records_dir);
-        
+
         Self {
             config_dir,
             records_dir,
         }
     }
-    
+
     fn get_config_dir() -> PathBuf {
         // 使用 exe 所在目录下的 .mav_testbed
         std::env::current_exe()
@@ -203,7 +203,7 @@ impl ConfigManager {
             .unwrap_or_else(|| std::env::current_dir().unwrap())
             .join(".mav_testbed")
     }
-    
+
     /// 加载应用配置
     pub fn load_app_config(&self) -> AppConfig {
         let path = self.config_dir.join("config.toml");
@@ -213,14 +213,14 @@ impl ConfigManager {
             AppConfig::default()
         }
     }
-    
+
     /// 保存应用配置
     pub fn save_app_config(&self, config: &AppConfig) -> Result<(), String> {
         let path = self.config_dir.join("config.toml");
         let content = toml::to_string_pretty(config).map_err(|e| e.to_string())?;
         fs::write(&path, content).map_err(|e| e.to_string())
     }
-    
+
     /// 列出所有保存的测试记录
     pub fn list_records(&self) -> Vec<String> {
         let mut records = Vec::new();
@@ -236,32 +236,32 @@ impl ConfigManager {
         records.sort();
         records
     }
-    
+
     /// 加载测试记录
     pub fn load_record(&self, name: &str) -> Result<SendTestRecord, String> {
         let path = self.records_dir.join(format!("{}.json", name));
         let content = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         serde_json::from_str(&content).map_err(|e| e.to_string())
     }
-    
+
     /// 保存测试记录
     pub fn save_record(&self, record: &SendTestRecord) -> Result<(), String> {
         let path = self.records_dir.join(format!("{}.json", record.name));
         let content = serde_json::to_string_pretty(record).map_err(|e| e.to_string())?;
         fs::write(&path, content).map_err(|e| e.to_string())
     }
-    
+
     /// 删除测试记录
     pub fn delete_record(&self, name: &str) -> Result<(), String> {
         let path = self.records_dir.join(format!("{}.json", name));
         fs::remove_file(&path).map_err(|e| e.to_string())
     }
-    
+
     /// 获取配置目录路径
     pub fn config_dir(&self) -> &Path {
         &self.config_dir
     }
-    
+
     /// 获取记录目录路径
     pub fn records_dir(&self) -> &Path {
         &self.records_dir
