@@ -4,7 +4,10 @@
 
 // Windows下隐藏控制台窗口
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
+#![allow(dead_code)]
+#![allow(unused_variables)]
+#![allow(unused_assignments)]
+#![allow(unused_mut)]
 mod config;
 mod mavlink;
 mod mav_mapper;
