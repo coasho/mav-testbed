@@ -283,6 +283,13 @@ impl MavTestbedApp {
                         self.is_connecting = false;
                         self.log("已连接".to_string());
                     }
+
+                    // 实时更新recv_stats中的字段值
+                    if let Some(stat) = self.recv_stats.iter_mut().find(|s| s.msg_id == msg_id) {
+                        stat.last_header = Some(header);
+                        stat.last_fields = fields.clone();
+                    }
+
                     let msg = ReceivedMessage {
                         timestamp: chrono::Local::now().format("%H:%M:%S%.3f").to_string(),
                         header,
@@ -837,6 +844,7 @@ impl MavTestbedApp {
                             let mut to_remove = None;
                             let mut to_edit = None;
                             let mut config_changed = false;
+
                             for (idx, config) in self.send_configs.iter_mut().enumerate() {
                                 let border_color = if config.enabled {
                                     egui::Color32::from_rgb(0, 180, 0)
@@ -849,6 +857,7 @@ impl MavTestbedApp {
                                 } else {
                                     ui.style().visuals.extreme_bg_color
                                 };
+
                                 egui::Frame::none()
                                     .fill(bg_color)
                                     .stroke(egui::Stroke::new(2.0, border_color))
@@ -961,9 +970,7 @@ impl MavTestbedApp {
                                         }
                                     });
                             }
-                            if config_changed {
-                                self.send_config_update();
-                            }
+
                             if let Some(idx) = to_remove {
                                 let config = self.send_configs.remove(idx);
                                 self.selected_messages.remove(&config.msg_id);
@@ -973,6 +980,10 @@ impl MavTestbedApp {
                             if let Some(idx) = to_edit {
                                 let config = &self.send_configs[idx];
                                 self.open_edit_dialog_with_config(config.clone(), idx);
+                            }
+
+                            if config_changed {
+                                self.send_config_update();
                             }
                         });
                 }
