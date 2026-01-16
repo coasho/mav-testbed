@@ -224,21 +224,32 @@ impl TestbedBackend {
     ) {
         let mut stats: HashMap<u32, MessageStats> = HashMap::new();
         let mut last_stats_send = Instant::now();
-        let mut first_message_received = false;
+        let mut connection_reported = false;  // 是否已报告连接状态
 
         // UDP：直接设为已连接，不等待收到消息
         if is_connectionless {
             let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
+            connection_reported = true;
         }
 
         while running.load(Ordering::Relaxed) {
-            // 只有TCP才检查连接状态（UDP不检查）
-            if !is_connectionless && first_message_received && !rx.is_connected() {
-                // 关键：停止mav_conn的connection_loop，防止继续发心跳或自动重连
-                rx.shutdown();
-                let _ = event_tx.send(BackendEvent::ConnectionStateChanged(false, connection_id));
-                let _ = event_tx.send(BackendEvent::Log("对端已断开".to_string()));
-                break;
+            // TCP：检查底层连接状态
+            if !is_connectionless {
+                let is_connected = rx.is_connected();
+
+                // 底层已连接但还没报告 → 发送已连接状态
+                if is_connected && !connection_reported {
+                    connection_reported = true;
+                    let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
+                }
+
+                // 已报告连接但底层断开 → 发送断开状态
+                if connection_reported && !is_connected {
+                    rx.shutdown();
+                    let _ = event_tx.send(BackendEvent::ConnectionStateChanged(false, connection_id));
+                    let _ = event_tx.send(BackendEvent::Log("对端已断开".to_string()));
+                    break;
+                }
             }
 
             if let Some((header, msg)) = rx.recv_timeout(Duration::from_millis(100)) {
@@ -247,12 +258,11 @@ impl TestbedBackend {
                     break;
                 }
 
-                // TCP：首次收到消息才设为已连接
-                if !is_connectionless && !first_message_received {
-                    first_message_received = true;
+                // 收到消息时确保已报告连接状态
+                if !connection_reported {
+                    connection_reported = true;
                     let _ = event_tx.send(BackendEvent::ConnectionStateChanged(true, connection_id));
                 }
-                first_message_received = true;
 
                 let msg_id = msg.message_id();
                 let msg_name = mapper
