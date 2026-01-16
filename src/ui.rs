@@ -261,6 +261,11 @@ impl MavTestbedApp {
                             self.is_connected = true;
                             self.is_connecting = false;
                             self.log("已连接".to_string());
+                            // TCP连接成功后自动发送
+                            let enabled_count = self.send_configs.iter().filter(|c| c.enabled).count();
+                            if enabled_count > 0 {
+                                self.start_sending();
+                            }
                         }
                     } else {
                         self.is_connected = false;
@@ -348,6 +353,21 @@ impl MavTestbedApp {
         self.is_connecting = true;
         while self.event_rx.try_recv().is_ok() {}
         let _ = self.cmd_tx.send(UiCommand::Connect(self.connection_config.clone(), self.connection_id));
+
+        // UDP/串口：确定后立即开始发送（不需要等待连接确认）
+        match self.connection_config.conn_type {
+            ConnectionType::Udp | ConnectionType::UdpIn | ConnectionType::UdpOut | ConnectionType::Serial => {
+                self.is_connected = true;
+                self.is_connecting = false;
+                let enabled_count = self.send_configs.iter().filter(|c| c.enabled).count();
+                if enabled_count > 0 {
+                    self.start_sending();
+                }
+            }
+            _ => {
+                // TCP：等待连接成功事件
+            }
+        }
     }
 
     fn disconnect(&mut self) {
@@ -364,7 +384,7 @@ impl MavTestbedApp {
     fn start_sending(&mut self) {
         let configs: Vec<_> = self.send_configs.iter().filter(|c| c.enabled).cloned().collect();
         if configs.is_empty() {
-            self.log_error("没有启用的发送消息".to_string());
+            // 静默处理，不再报错（因为可能是自动调用）
             return;
         }
         let _ = self.cmd_tx.send(UiCommand::StartSending(configs));
@@ -795,17 +815,8 @@ impl MavTestbedApp {
                     ui.vertical_centered(|ui| {
                         ui.label(
                             egui::RichText::new("从左侧选择要发送的消息")
-                                .size(FONT_SIZE_LARGE)
+                                .size(FONT_SIZE_BASE)
                                 .weak()
-                        );
-                        ui.add_space(SPACING_LARGE);
-                        ui.label(
-                            egui::RichText::new("勾选消息后会自动添加到此处")
-                                .size(FONT_SIZE_BASE)
-                        );
-                        ui.label(
-                            egui::RichText::new("点击 ✏编辑 按钮可编辑字段值")
-                                .size(FONT_SIZE_BASE)
                         );
                     });
                 } else {
@@ -1534,6 +1545,7 @@ impl MavTestbedApp {
     /// 消息编辑对话框
     fn show_message_edit_dialog(&mut self, ctx: &egui::Context) {
         let mut open = self.edit_dialog.open;
+        let mut should_close = false;
 
         egui::Window::new(
             egui::RichText::new(format!("✏ 编辑消息: {}", self.edit_dialog.config.msg_name))
@@ -1696,16 +1708,17 @@ impl MavTestbedApp {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = SPACING_LARGE;
                     if Self::large_button(ui, "✖", "取消").clicked() {
-                        self.edit_dialog.open = false;
+                        should_close = true;
                     }
                     if Self::large_button(ui, "✔", "保存").clicked() {
                         self.apply_edit_dialog();
-                        self.edit_dialog.open = false;
+                        should_close = true;
                     }
                 });
             });
 
-        self.edit_dialog.open = open;
+        // 窗口X按钮或我们的按钮都可以关闭
+        self.edit_dialog.open = open && !should_close;
     }
 
     // ========== 辅助方法 ==========
@@ -1715,7 +1728,7 @@ impl MavTestbedApp {
             id: uuid::Uuid::new_v4().to_string(),
             msg_name: msg_name.to_string(),
             msg_id,
-            enabled: false,
+            enabled: true,  // 勾选即启用
             rate_hz: 1.0,
             fields: HashMap::new(),
             use_custom_header: false,
