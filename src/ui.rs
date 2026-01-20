@@ -504,15 +504,6 @@ impl MavTestbedApp {
         ui.add_space(4.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = SPACING_LARGE;
-
-            ui.label(
-                egui::RichText::new(format!("🛩 MAVLink测试台 #{}", self.window_id))
-                    .strong()
-                    .size(FONT_SIZE_HEADING),
-            );
-
-            ui.separator();
-
             // XML加载
             if Self::large_button(ui, "📂", "加载XML").clicked() {
                 if let Some(path) = rfd::FileDialog::new()

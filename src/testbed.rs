@@ -23,6 +23,11 @@ pub struct MessageStats {
     pub last_seen: Option<Instant>,
     pub last_header: Option<MavHeader>,
     pub last_fields: HashMap<String, f64>,
+    // 滑动窗口统计（用于准确计算频率）
+    #[doc(hidden)]
+    pub window_start: Option<Instant>,
+    #[doc(hidden)]
+    pub window_count: u64,
 }
 
 /// 后端事件
@@ -265,12 +270,33 @@ impl TestbedBackend {
                 });
                 stat.count += 1;
                 let now = Instant::now();
-                if let Some(last) = stat.last_seen {
-                    let elapsed = now.duration_since(last).as_secs_f32();
-                    if elapsed > 0.001 {
-                        stat.rate_hz = stat.rate_hz * 0.9 + (1.0 / elapsed) * 0.1;
+
+                // 使用滑动窗口计算频率（窗口大小 500ms）
+                const WINDOW_DURATION_MS: u64 = 500;
+
+                match stat.window_start {
+                    None => {
+                        // 首次收到消息，初始化窗口
+                        stat.window_start = Some(now);
+                        stat.window_count = 1;
+                    }
+                    Some(start) => {
+                        let elapsed_ms = now.duration_since(start).as_millis() as u64;
+                        stat.window_count += 1;
+
+                        if elapsed_ms >= WINDOW_DURATION_MS {
+                            // 窗口时间到，计算频率并重置
+                            let elapsed_secs = elapsed_ms as f32 / 1000.0;
+                            let instant_rate = stat.window_count as f32 / elapsed_secs;
+                            // 使用较快的 EMA 收敛（0.6/0.4）
+                            stat.rate_hz = stat.rate_hz * 0.6 + instant_rate * 0.4;
+                            // 重置窗口
+                            stat.window_start = Some(now);
+                            stat.window_count = 0;
+                        }
                     }
                 }
+
                 stat.last_seen = Some(now);
                 stat.last_header = Some(header);
                 stat.last_fields = fields.clone();

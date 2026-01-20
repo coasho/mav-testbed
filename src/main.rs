@@ -36,12 +36,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1200.0, 800.0])
             .with_min_inner_size([800.0, 600.0])
-            .with_title(format!("MAVLink测试台 #{}", window_id)),
+            .with_title(format!("MAVLink调试工具 #{}", window_id)),
         ..Default::default()
     };
 
     eframe::run_native(
-        &"MAVLink网络调试工具".to_string(),
+        &"MAVLink调试工具".to_string(),
         options,
         Box::new(move |cc| {
             Ok(Box::new(ui::MavTestbedApp::new(cc, window_id)))
