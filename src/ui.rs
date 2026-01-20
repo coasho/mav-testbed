@@ -1207,7 +1207,12 @@ impl MavTestbedApp {
                                 let mut display_fields: Vec<(String, String)> = Vec::new();
 
                                 for (name, value) in &base_fields {
-                                    if *value < 0.0 {
+                                    // char数组的标记是 -(len + 0.5)，小数部分为0.5
+                                    // 普通负数（如 int16_t = -1）小数部分为0
+                                    let frac = value.fract().abs();
+                                    let is_char_array_marker = *value < 0.0 && (frac - 0.5).abs() < 0.01;
+
+                                    if is_char_array_marker {
                                         if let Some(elements) = array_elements.get(name) {
                                             let s: String = elements
                                                 .iter()
